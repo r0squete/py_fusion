@@ -4,37 +4,36 @@ Created on Mon Sept 8 2025
 
 CLI for running fusion on NetCDF files using xarray.
 
-Usage (run from repo root):
-  # Single files
+Usage (repository root):
   python -m py_code.cli_fusion \
       --l3 path_to_L3.nc --l3-var L3_varname \
       --template path_to_template.nc --template-var T_varname \
       --width 20 --exponent 2 \
       --mask-mode L3 --log-mode none --boundary zero \
-      --output fused.nc
+      --output "/out_dir/fused_{date}.nc"
 
-  # Multiple files via globs (no temporal alignment performed here)
   python -m py_code.cli_fusion \
       --l3 "L3_dir/*.nc" --l3-var L3_varname \
       --template "T_dir/*.nc" --template-var T_varname \
       --boundary reflect \
-      --output fused.nc
+      --output "/out_dir/fused_{index}.nc"
 
-  # Different dim names per dataset (only if they differ from standard time/lat/lon)
   python -m py_code.cli_fusion \
       --l3 "L3_dir/*.nc" --l3-var L3_varname --l3-y-dim latitude --l3-x-dim longitude --l3-time-dim time \
       --template "T_dir/*.nc" --template-var T_varname --t-y-dim lat --t-x-dim lon --t-time-dim time \
-      --output fused.nc
+      --output "/out_dir/daily_SST_{l3_name}_{date}.nc"
 """
 
 # Libraries
 import argparse
 import glob
 import logging
+from pathlib import Path
 import numpy as np
+import pandas as pd
 import xarray as xr
-from py_code.config import make_dims, make_params, make_vars, make_io, nc_encoding
-from py_code.fusion_xr import build_kernel, fusion_xr
+from py_fusion.config import make_dims, make_params, make_vars, make_io, nc_encoding
+from py_fusion.fusion_xr import build_kernel, fusion_xr
 
 # Module logger
 logger = logging.getLogger(__name__)
@@ -62,7 +61,8 @@ def parse_args(argv=None):
     p.add_argument("--t-time-dim", default=None, help="Template time dim name (mapped to 'time'; default: time)")
     p.add_argument("--t-y-dim", default=None, help="Template Y dim name (mapped to 'lat'; default: lat)")
     p.add_argument("--t-x-dim", default=None, help="Template X dim name (mapped to 'lon'; default: lon)")
-    p.add_argument("--output", required=True, dest="output_path")
+    p.add_argument("--output", required=True, dest="output_path",
+                   help="Output path pattern; available placeholders: {index}, {date}, {l3_name}, {template_name}")
     p.add_argument("--no-zlib", action="store_true")
     p.add_argument("--complevel", type=int, default=4)
     p.add_argument("--verbose", action="store_true", help="Print progress information")
@@ -104,6 +104,8 @@ def main(argv=None):
         raise FileNotFoundError("No L3 files matched the provided patterns")
     if not t_files:
         raise FileNotFoundError("No template files matched the provided patterns")
+    if len(l3_files) != len(t_files):
+        raise ValueError(f"Number of L3 files ({len(l3_files)}) does not match template files ({len(t_files)})")
 
     # Preprocess: keep only target var (coords/dims are preserved)
     def _pp_l3(ds):
@@ -115,15 +117,6 @@ def main(argv=None):
         if args.template_var not in ds:
             raise KeyError(f"Template var '{args.template_var}' not found in one of the files")
         return ds[[args.template_var]]
-
-    # Load datasets (no temporal alignment here)
-    if args.verbose:
-        logger.info("[cli] Opening input datasets (multi-file)...")
-    ds_L3 = xr.open_mfdataset(l3_files, combine="by_coords", preprocess=_pp_l3)
-    ds_T = xr.open_mfdataset(t_files, combine="by_coords", preprocess=_pp_t)
-    if vars_cfg["l3_var"] not in ds_L3 or vars_cfg["template_var"] not in ds_T:
-        ds_L3.close(); ds_T.close()
-        raise KeyError("Variable not found in merged input datasets.")
 
     # Resolve per-dataset dim names (fallback to canonical)
     canon_t, canon_y, canon_x = "time", "lat", "lon"
@@ -151,9 +144,6 @@ def main(argv=None):
             ds = ds.rename(mapping)
         return ds
 
-    ds_L3 = _rename_to_canon(ds_L3, l3_t, l3_y, l3_x, "L3")
-    ds_T  = _rename_to_canon(ds_T,  t_t,  t_y,  t_x,  "template")
-
     # Ensure rectilinear 1D coords if provided as 2D (tolerate 1D/2D representations)
     def _rectilinearize(ds, label):
         if "lat" in ds.coords and getattr(ds["lat"], "ndim", 1) == 2 and "lon" in ds.coords and ds["lon"].ndim == 2:
@@ -171,71 +161,164 @@ def main(argv=None):
             ds = ds.assign_coords(lat=("lat", lat1d), lon=("lon", lon1d))
         return ds
 
-    ds_L3 = _rectilinearize(ds_L3, "L3")
-    ds_T  = _rectilinearize(ds_T,  "template")
-
-    da_L3 = ds_L3[vars_cfg["l3_var"]]
-    da_T = ds_T[vars_cfg["template_var"]]
-    if args.verbose:
-        logger.info(f"[cli] Variables loaded: L3='{vars_cfg['l3_var']}', T='{vars_cfg['template_var']}'.")
-
-    # Validate dims and coords (strict)
-    tdim, ydim, xdim = canon_t, canon_y, canon_x
-    for name, da in (("L3", da_L3), ("template", da_T)):
-        for dim in (tdim, ydim, xdim):
-            if dim not in da.dims:
-                ds_L3.close(); ds_T.close()
-                raise ValueError(f"[{name}] missing required dim '{dim}' in variable '{da.name}'")
-    # Grid equality
     def _get_coord(ds, dim):
         if dim in ds.coords:
             return ds[dim].values
         # If no coord var, fail per requirement
-        ds_L3.close(); ds_T.close()
         raise ValueError(f"Missing coordinate variable for dim '{dim}'")
 
-    lat_L3 = _get_coord(da_L3.to_dataset(name="_tmp"), ydim)
-    lon_L3 = _get_coord(da_L3.to_dataset(name="_tmp"), xdim)
-    lat_T = _get_coord(da_T.to_dataset(name="_tmp"), ydim)
-    lon_T = _get_coord(da_T.to_dataset(name="_tmp"), xdim)
-    if lat_L3.shape != lat_T.shape or lon_L3.shape != lon_T.shape:
-        ds_L3.close(); ds_T.close()
-        raise ValueError("Latitude/Longitude shapes differ between L3 and template")
-    if not (np.allclose(lat_L3, lat_T, atol=1e-2, rtol=0.0) and np.allclose(lon_L3, lon_T, atol=1e-2, rtol=0.0)):
-        ds_L3.close(); ds_T.close()
-        raise ValueError("Latitude/Longitude coordinate values differ between L3 and template")
+    def _normalize_time_index(ds, dim):
+        if dim in ds.indexes:
+            raw = ds.indexes[dim]
+            values = getattr(raw, "values", raw)
+        else:
+            values = ds[dim].values
+        timestamps = []
+        for val in values:
+            try:
+                ts = pd.Timestamp(val)
+            except Exception:
+                ts = pd.Timestamp(str(val))
+            if ts.tz is not None:
+                ts = ts.tz_convert(None)
+            timestamps.append(ts.normalize())
+        return pd.DatetimeIndex(timestamps, name=dim)
 
-    # Time equality (no alignment)
-    time_L3 = _get_coord(ds_L3, tdim)
-    time_T = _get_coord(ds_T, tdim)
-    # Check monotonic and unique
-    def _mono_unique(tvals, label):
-        if tvals.ndim != 1:
-            raise ValueError(f"[{label}] time coordinate must be 1-D")
-        if not (np.all(np.diff(tvals) > np.timedelta64(0, 'ns')) or np.all(np.diff(tvals) > 0)):
-            raise ValueError(f"[{label}] time coordinate not strictly increasing or contains duplicates")
-    _mono_unique(time_L3, "L3")
-    _mono_unique(time_T, "template")
-    if time_L3.shape != time_T.shape or not np.array_equal(time_L3, time_T):
-        ds_L3.close(); ds_T.close()
-        raise ValueError("Time coordinates do not match exactly between L3 and template (no alignment performed)")
+    def _mono_unique(idx, label):
+        if not isinstance(idx, pd.Index):
+            idx = pd.Index(idx)
+        if not idx.is_monotonic_increasing:
+            raise ValueError(f"[{label}] time coordinate not strictly increasing")
+        if not idx.is_unique:
+            raise ValueError(f"[{label}] time coordinate contains duplicates")
 
-    # Build kernel and run fusion
+    # Build kernel once; reuse for every pair
     if args.verbose:
         logger.info(f"[cli] Building kernel with width={params['width']} exponent={params['exponent']}...")
     kernel = build_kernel(params)
-    if args.verbose:
-        logger.info("[cli] Running fusion...")
-    out = fusion_xr(da_L3, da_T, params, kernel=kernel)
 
-    # Save
-    encoding = nc_encoding(io_cfg)
-    if args.verbose:
-        logger.info(f"[cli] Saving output to {io_cfg['output_path']}...")
-    out.to_netcdf(io_cfg["output_path"], encoding=encoding)
+    # Prepare output pattern
+    output_template = Path(io_cfg["output_path"])
+    if output_template.name == "":
+        raise ValueError("--output must include a filename or pattern (not just a directory path)")
+    out_dir = output_template.parent if output_template.parent != Path("") else Path(".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pattern_name = output_template.name
+    available_keys = ("index", "date", "l3_name", "template_name")
 
-    ds_L3.close(); ds_T.close()
-    print(f"Saved: {io_cfg['output_path']}")
+    def _format_date(idx):
+        if len(idx) == 0:
+            return "no_time"
+        first = idx[0]
+        if isinstance(first, (pd.Timestamp, np.datetime64)):
+            return pd.Timestamp(first).strftime("%Y%m%d")
+        if hasattr(first, "strftime"):
+            return first.strftime("%Y%m%d")
+        return str(first)
+
+    tdim, ydim, xdim = canon_t, canon_y, canon_x
+    saved_paths = []
+    total_pairs = len(l3_files)
+    for idx, (l3_path, t_path) in enumerate(zip(l3_files, t_files), start=1):
+        if args.verbose:
+            logger.info(f"[cli] Processing pair {idx}/{total_pairs}: L3='{l3_path}' | Template='{t_path}'")
+        with xr.open_dataset(l3_path) as ds_L3_raw, xr.open_dataset(t_path) as ds_T_raw:
+            ds_L3 = _pp_l3(ds_L3_raw)
+            ds_T = _pp_t(ds_T_raw)
+
+            ds_L3 = _rename_to_canon(ds_L3, l3_t, l3_y, l3_x, "L3")
+            ds_T = _rename_to_canon(ds_T, t_t, t_y, t_x, "template")
+
+            ds_L3 = _rectilinearize(ds_L3, "L3")
+            ds_T = _rectilinearize(ds_T, "template")
+
+            da_L3 = ds_L3[vars_cfg["l3_var"]]
+            da_T = ds_T[vars_cfg["template_var"]]
+
+            for name, da in (("L3", da_L3), ("template", da_T)):
+                for dim in (tdim, ydim, xdim):
+                    if dim not in da.dims:
+                        raise ValueError(f"[{name}] missing required dim '{dim}' in variable '{da.name}'")
+
+            lat_L3 = _get_coord(da_L3.to_dataset(name="_tmp"), ydim)
+            lon_L3 = _get_coord(da_L3.to_dataset(name="_tmp"), xdim)
+            lat_T = _get_coord(da_T.to_dataset(name="_tmp"), ydim)
+            lon_T = _get_coord(da_T.to_dataset(name="_tmp"), xdim)
+            if lat_L3.shape != lat_T.shape or lon_L3.shape != lon_T.shape:
+                raise ValueError("Latitude/Longitude shapes differ between L3 and template")
+            if not (np.allclose(lat_L3, lat_T, atol=1e-2, rtol=0.0) and np.allclose(lon_L3, lon_T, atol=1e-2, rtol=0.0)):
+                raise ValueError("Latitude/Longitude coordinate values differ between L3 and template")
+
+            time_idx_L3 = _normalize_time_index(ds_L3, tdim)
+            time_idx_T = _normalize_time_index(ds_T, tdim)
+            _mono_unique(time_idx_L3, "L3")
+            _mono_unique(time_idx_T, "template")
+
+            common_times = time_idx_L3.intersection(time_idx_T)
+            if len(common_times) == 0:
+                l3_start = time_idx_L3[0] if len(time_idx_L3) else "empty"
+                l3_end = time_idx_L3[-1] if len(time_idx_L3) else "empty"
+                tpl_start = time_idx_T[0] if len(time_idx_T) else "empty"
+                tpl_end = time_idx_T[-1] if len(time_idx_T) else "empty"
+                raise ValueError(
+                    "No overlapping time steps between L3 and template after normalization "
+                    f"(L3 range: {l3_start}..{l3_end}; template range: {tpl_start}..{tpl_end})"
+                )
+            if hasattr(common_times, "sort_values"):
+                common_times = common_times.sort_values()
+            else:
+                common_times = pd.Index(sorted(common_times))
+
+            if (len(common_times) != len(time_idx_L3) or len(common_times) != len(time_idx_T)) and args.verbose:
+                logger.info(
+                    "[cli] Aligning time axes: L3=%d, template=%d, common=%d",
+                    len(time_idx_L3), len(time_idx_T), len(common_times),
+                )
+
+            da_L3 = ds_L3.reindex({tdim: common_times})[vars_cfg["l3_var"]]
+            da_T = ds_T.reindex({tdim: common_times})[vars_cfg["template_var"]]
+
+            aligned_times = common_times
+
+            if args.verbose:
+                dims = params["dims"]
+                has_t = dims["time"] in da_L3.dims
+                if has_t:
+                    nt = da_L3.sizes[dims["time"]]
+                    logger.info(f"[cli] Running fusion on 3D stack: nt={nt}, ny={da_L3.sizes[dims['y']]}, nx={da_L3.sizes[dims['x']]}...")
+                else:
+                    logger.info(f"[cli] Running fusion on 2D field: ny={da_L3.sizes[dims['y']]}, nx={da_L3.sizes[dims['x']]}...")
+            out = fusion_xr(da_L3, da_T, params, kernel=kernel)
+
+            date_label = _format_date(aligned_times)
+            context = {
+                "index": idx,
+                "date": date_label,
+                "l3_name": Path(l3_path).stem,
+                "template_name": Path(t_path).stem,
+            }
+            try:
+                file_name = pattern_name.format(**context)
+            except KeyError as exc:
+                exc_key = exc.args[0]
+                raise KeyError(
+                    f"Placeholder '{{{exc_key}}}' not available in --output pattern. "
+                    f"Use only {available_keys}"
+                ) from exc
+            pair_out = out_dir / file_name
+
+            if args.verbose:
+                logger.info(f"[cli] Saving output to {pair_out}...")
+            pair_io_cfg = dict(io_cfg)
+            pair_io_cfg["output_path"] = str(pair_out)
+            encoding = nc_encoding(pair_io_cfg)
+            out.to_netcdf(pair_out, encoding=encoding)
+
+            saved_paths.append(pair_out)
+            print(f"Saved: {pair_out} (L3={l3_path}, template={t_path})")
+
+    if args.verbose:
+        logger.info(f"[cli] Generated {len(saved_paths)} output files.")
 
 
 if __name__ == "__main__":  
