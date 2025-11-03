@@ -3,9 +3,9 @@
 Python utilities for Work Package 1 (WP1) of the FRESH-CARE project, focused on fusing gridded geophysical fields using spatially weighted local linear regression. The toolkit targets workflows where a coarse Level-3 (L3) product is sharpened with a higher-resolution template while preserving quantitative traceability.
 
 ## Overview
-- Core numerical routines (`py_code.fusion`) implement a NaN-aware 2D/3D local regression with configurable boundary handling and inverse-distance kernels.
-- An xarray wrapper (`py_code.fusion_xr`) keeps coordinates/attributes intact and streamlines fusion for NetCDF datasets.
-- A command-line interface (`python -m py_code.cli_fusion`) orchestrates multi-file NetCDF input, dimension remapping, coordinate validation, and NetCDF output with optional compression.
+- Core numerical routines (`py_fusion.fusion`) implement a NaN-aware 2D/3D local regression with configurable boundary handling and inverse-distance kernels.
+- An xarray wrapper (`py_fusion.fusion_xr`) keeps coordinates/attributes intact and streamlines fusion for NetCDF datasets.
+- A command-line interface (`python -m py_fusion.cli_fusion`) orchestrates multi-file NetCDF input, dimension remapping, coordinate validation, and NetCDF output with optional compression.
 
 ## Requirements
 - Python 3.9 or newer (tested with CPython; PyPy not yet validated).
@@ -37,7 +37,7 @@ python -m py_code.cli_fusion \
 ```
 Key behaviour:
 - Accepts one or more files per input via shell globs (e.g., `"data/L3/*.nc"`).
-- Verifies that L3 and template share the same rectilinear grid and time stamps (no regridding or temporal alignment is performed).
+- Verifies that L3 and template share the same rectilinear grid (no regridding is performed).
 - Supports optional dimension remapping flags (`--l3-x-dim`, `--t-y-dim`, …) when datasets use non-standard names.
 - Writes a NetCDF file containing the fused field (`L4`) plus diagnostic layers (`a`, `b`, `rho`, `err`).
   
